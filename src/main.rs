@@ -247,10 +247,21 @@ enum State {
     Recording { capture: audio::AudioCapture },
 }
 
+/// Cached EI (Emulated Input) state reused across dictations to avoid
+/// creating a new XDG RemoteDesktop portal session per dictation.
+#[cfg(target_os = "linux")]
+struct EiState {
+    context: reis::ei::Context,
+    device: reis::ei::Device,
+    keyboard: reis::ei::Keyboard,
+}
+
 struct Daemon {
     model: Arc<Mutex<ParakeetModel>>,
     state: Mutex<State>,
     config: Config,
+    #[cfg(target_os = "linux")]
+    ei_state: Mutex<Option<EiState>>,
 }
 
 async fn run_daemon(model_override: Option<PathBuf>) -> Result<()> {
@@ -294,6 +305,8 @@ async fn run_daemon(model_override: Option<PathBuf>) -> Result<()> {
         model: Arc::new(Mutex::new(model)),
         state: Mutex::new(State::Idle),
         config: cfg,
+        #[cfg(target_os = "linux")]
+        ei_state: Mutex::new(None),
     });
 
     let sock_cleanup = socket.clone();
@@ -419,7 +432,7 @@ async fn stop_and_transcribe(daemon: &Daemon) -> Result<String> {
         format!("{cleaned} ")
     };
     if !out.is_empty() {
-        emit_text(&out, &daemon.config).await;
+        emit_text(&out, daemon).await;
     }
     Ok(out)
 }
@@ -515,22 +528,22 @@ fn cleanup_transcription(text: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-async fn emit_text(text: &str, cfg: &Config) {
+async fn emit_text(text: &str, daemon: &Daemon) {
     let t0 = Instant::now();
     log::info!(
         "emit: start (len={}, write_clipboard={}, auto_paste={})",
         text.len(),
-        cfg.write_clipboard,
-        cfg.auto_paste
+        daemon.config.write_clipboard,
+        daemon.config.auto_paste
     );
 
-    if let Err(e) = wl_copy(text, cfg.write_clipboard) {
+    if let Err(e) = wl_copy(text, daemon.config.write_clipboard) {
         log::warn!("wl-copy failed: {e:#}");
     }
     log::info!("emit: wl_copy returned at +{:?}", t0.elapsed());
 
-    if cfg.auto_paste {
-        if let Err(e) = ei_paste(cfg).await {
+    if daemon.config.auto_paste {
+        if let Err(e) = ei_paste(daemon).await {
             log::warn!("ei paste failed: {e:#}");
         }
         log::info!("emit: paste returned at +{:?}", t0.elapsed());
@@ -575,22 +588,55 @@ fn wl_copy(text: &str, also_clipboard: bool) -> Result<()> {
 
 /// Paste via the Wayland EI (Emulated Input) protocol using the `reis` crate.
 /// Connects to the compositor's EIS server, creates a virtual keyboard, and
-/// sends Shift+Insert.
+/// sends Shift+Insert. Reuses a cached EI context across dictations to avoid
+/// creating a new XDG RemoteDesktop portal session each time.
 #[cfg(target_os = "linux")]
-async fn ei_paste(cfg: &Config) -> Result<()> {
+async fn ei_paste(daemon: &Daemon) -> Result<()> {
     use reis::ei;
     use std::collections::HashMap;
 
     const KEY_LEFTSHIFT: u32 = 42;
     const KEY_INSERT: u32 = 110;
 
-    // Connect to EIS — try env socket first, then XDG RemoteDesktop portal.
+    // Check if we have a usable cached EI context.
+    {
+        let ei_state = daemon.ei_state.lock().await;
+        if let Some(ref state) = *ei_state {
+            if state.keyboard.is_alive() {
+                log::info!("ei: reusing cached context");
+                let last_serial: u32 = u32::MAX;
+                state.device.start_emulating(0, last_serial);
+
+                state.keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Press);
+                state.keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Press);
+                state.device.frame(last_serial, 0);
+
+                state.keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Released);
+                state.keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Released);
+                state.device.frame(last_serial, 0);
+
+                state.device.stop_emulating(last_serial);
+                if let Err(e) = state.context.flush() {
+                    log::warn!("ei: flush failed on cached context, will recreate: {e}");
+                    drop(ei_state);
+                    *daemon.ei_state.lock().await = None;
+                    return Err(anyhow!("ei flush: {e}"));
+                }
+                log::info!("ei: sent Shift+Insert via cached virtual keyboard");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                return Ok(());
+            }
+            log::info!("ei: cached context no longer alive, recreating");
+        }
+    }
+
+    // Create a new EI context — try env socket first, then XDG RemoteDesktop portal.
     let context = if let Some(ctx) = ei::Context::connect_to_env().ok().flatten() {
         log::info!("ei: connected via LIBEI_SOCKET");
         ctx
     } else {
         log::info!("ei: no LIBEI_SOCKET, requesting portal access");
-        connect_eis_via_portal(&cfg.permission_lifetime).await?
+        connect_eis_via_portal(&daemon.config.permission_lifetime).await?
     };
 
     // Blocking handshake on a dedicated thread.
@@ -718,31 +764,43 @@ async fn ei_paste(cfg: &Config) -> Result<()> {
         return Err(anyhow!("ei: no keyboard device found after scanning events"));
     }
 
-    // Find the first resumed device with a keyboard and send Shift+Insert.
-    let mut sent = false;
+    // Find the first resumed device with a keyboard.
+    let mut found_device = None;
+    let mut found_keyboard_obj = None;
     for (device, data) in &devices {
         if let (Some(keyboard), true) = (&data.keyboard, data.resumed) {
-            device.start_emulating(0, last_serial);
-
-            keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Press);
-            keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Press);
-            device.frame(last_serial, 0);
-
-            keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Released);
-            keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Released);
-            device.frame(last_serial, 0);
-
-            device.stop_emulating(last_serial);
-            context.flush().map_err(|e| anyhow!("ei flush key events: {e}"))?;
-            log::info!("ei: sent Shift+Insert via virtual keyboard");
-            sent = true;
+            found_device = Some(device.clone());
+            found_keyboard_obj = Some(keyboard.clone());
             break;
         }
     }
 
-    if !sent {
-        return Err(anyhow!("ei: keyboard found but no events sent"));
-    }
+    let (device, keyboard) = match (found_device, found_keyboard_obj) {
+        (Some(d), Some(k)) => (d, k),
+        _ => return Err(anyhow!("ei: keyboard found but no events sent")),
+    };
+
+    // Cache the context, device, and keyboard for reuse.
+    *daemon.ei_state.lock().await = Some(EiState {
+        context: context.clone(),
+        device: device.clone(),
+        keyboard: keyboard.clone(),
+    });
+
+    // Send Shift+Insert.
+    device.start_emulating(0, last_serial);
+
+    keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Press);
+    keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Press);
+    device.frame(last_serial, 0);
+
+    keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Released);
+    keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Released);
+    device.frame(last_serial, 0);
+
+    device.stop_emulating(last_serial);
+    context.flush().map_err(|e| anyhow!("ei flush key events: {e}"))?;
+    log::info!("ei: sent Shift+Insert via virtual keyboard");
 
     // Brief pause so the compositor processes the events before we close.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
