@@ -63,6 +63,8 @@ If any of those fail, jump to [Troubleshooting](TROUBLESHOOTING.md).
 
 Most users won't need this — skip unless no prebuilt package matches your system, or you want to hack on utter.
 
+System libraries: you'll need the ALSA development headers (`alsa-devel` on Fedora/openSUSE, `libasound2-dev` on Debian/Ubuntu). Runtime libraries are already present on any system with audio output.
+
 ```bash
 git clone https://github.com/jguice/utter.git
 cd utter
