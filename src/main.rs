@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::Read;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -254,6 +255,151 @@ struct EiState {
     context: reis::ei::Context,
     device: reis::ei::Device,
     keyboard: reis::ei::Keyboard,
+    keymap: *mut xkbcommon_dl::xkb_keymap,
+    xkb_state: *mut xkbcommon_dl::xkb_state,
+}
+
+// Safety: The raw XKB pointers are only accessed from the async runtime
+// (single-threaded logical access via Mutex).
+#[cfg(target_os = "linux")]
+unsafe impl Send for EiState {}
+
+/// Wrapper to make raw XKB pointers Send-safe for use across `.await` points.
+/// The pointers are only dereferenced in unsafe blocks within the async runtime.
+#[cfg(target_os = "linux")]
+struct SendPtr<T>(*mut T);
+#[cfg(target_os = "linux")]
+unsafe impl<T> Send for SendPtr<T> {}
+
+#[cfg(target_os = "linux")]
+impl Drop for EiState {
+    fn drop(&mut self) {
+        let xkb = xkbcommon_dl::xkbcommon_handle();
+        unsafe {
+            if !self.xkb_state.is_null() {
+                (xkb.xkb_state_unref)(self.xkb_state);
+            }
+            if !self.keymap.is_null() {
+                (xkb.xkb_keymap_unref)(self.keymap);
+            }
+        }
+    }
+}
+
+/// Parse an XKB keymap from a file descriptor received from the compositor
+/// and create an xkb_state from it.
+#[cfg(target_os = "linux")]
+unsafe fn parse_keymap_from_fd(
+    fd: std::os::unix::io::OwnedFd,
+) -> Result<(*mut xkbcommon_dl::xkb_keymap, *mut xkbcommon_dl::xkb_state)> {
+    let xkb = xkbcommon_dl::xkbcommon_handle();
+
+    let mut file = std::fs::File::from(fd);
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .context("read keymap fd")?;
+
+    let ctx = (xkb.xkb_context_new)(xkbcommon_dl::xkb_context_flags::XKB_CONTEXT_NO_FLAGS);
+    if ctx.is_null() {
+        return Err(anyhow!("xkb_context_new failed"));
+    }
+
+    let keymap = (xkb.xkb_keymap_new_from_buffer)(
+        ctx,
+        buf.as_ptr() as *const _,
+        buf.len(),
+        xkbcommon_dl::xkb_keymap_format::XKB_KEYMAP_FORMAT_TEXT_V1,
+        xkbcommon_dl::xkb_keymap_compile_flags::XKB_KEYMAP_COMPILE_NO_FLAGS,
+    );
+    (xkb.xkb_context_unref)(ctx);
+
+    if keymap.is_null() {
+        return Err(anyhow!("xkb_keymap_new_from_buffer failed"));
+    }
+
+    let state = (xkb.xkb_state_new)(keymap);
+    if state.is_null() {
+        (xkb.xkb_keymap_unref)(keymap);
+        return Err(anyhow!("xkb_state_new failed"));
+    }
+
+    log::info!("ei: parsed XKB keymap from compositor");
+    Ok((keymap, state))
+}
+
+/// Map an ASCII character to an evdev keycode and whether Shift is needed.
+/// Uses US QWERTY layout. For non-ASCII chars, falls back to the XKB keymap
+/// using `find_key_for_char_xkb`.
+#[cfg(target_os = "linux")]
+fn char_to_evdev(ch: char) -> Option<(u32, bool)> {
+    // evdev keycodes for a-z from linux/input-event-codes.h (non-sequential).
+    const EVDEV_A_TO_Z: [u32; 26] = [
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, // a-m
+        49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44, // n-z
+    ];
+    Some(match ch {
+        'a'..='z' => (EVDEV_A_TO_Z[(ch as u8 - b'a') as usize], false),
+        'A'..='Z' => (EVDEV_A_TO_Z[(ch as u8 - b'A') as usize], true),
+        '0' => (11, false), '1' => (2, false), '2' => (3, false),
+        '3' => (4, false), '4' => (5, false), '5' => (6, false),
+        '6' => (7, false), '7' => (8, false), '8' => (9, false), '9' => (10, false),
+        ' ' => (57, false),
+        '-' => (12, false), '=' => (13, false),
+        '[' => (26, false), ']' => (27, false),
+        ';' => (39, false), '\'' => (40, false), '`' => (41, false),
+        '\\' => (43, false), ',' => (51, false), '.' => (52, false), '/' => (53, false),
+        '_' => (12, true), '+' => (13, true),
+        '{' => (26, true), '}' => (27, true),
+        ':' => (39, true), '"' => (40, true), '~' => (41, true),
+        '|' => (43, true), '<' => (51, true), '>' => (52, true), '?' => (53, true),
+        '!' => (2, true), '@' => (3, true), '#' => (4, true), '$' => (5, true),
+        '%' => (6, true), '^' => (7, true), '&' => (8, true), '*' => (9, true),
+        '(' => (10, true), ')' => (11, true),
+        '\n' => (28, false), '\t' => (15, false),
+        _ => return None,
+    })
+}
+
+/// Fallback: find the XKB keycode for a non-ASCII character using the XKB
+/// keymap. Returns `(evdev_keycode, shift_needed)` by subtracting the
+/// standard XKB offset (8) from the XKB keycode.
+#[cfg(target_os = "linux")]
+unsafe fn find_key_for_char_xkb(
+    keymap: *mut xkbcommon_dl::xkb_keymap,
+    ch: char,
+) -> Option<(u32, bool)> {
+    let xkb = xkbcommon_dl::xkbcommon_handle();
+    let target_cp = ch as u32;
+    let min = (xkb.xkb_keymap_min_keycode)(keymap);
+    let max = (xkb.xkb_keymap_max_keycode)(keymap);
+    let shift_idx = (xkb.xkb_keymap_mod_get_index)(
+        keymap,
+        xkbcommon_dl::XKB_MOD_NAME_SHIFT.as_ptr() as *const _,
+    );
+
+    for code in min..=max {
+        let num_layouts = (xkb.xkb_keymap_num_layouts_for_key)(keymap, code);
+        for layout in 0..num_layouts {
+            let num_levels = (xkb.xkb_keymap_num_levels_for_key)(keymap, code, layout);
+            for level in 0..num_levels {
+                let mut syms_ptr: *const xkbcommon_dl::xkb_keysym_t = std::ptr::null();
+                let count = (xkb.xkb_keymap_key_get_syms_by_level)(
+                    keymap, code, layout, level, &mut syms_ptr,
+                );
+                if count > 0 {
+                    let sym = *syms_ptr;
+                    let cp = (xkb.xkb_keysym_to_utf32)(sym);
+                    if cp == target_cp {
+                        // XKB keycode = evdev keycode + 8 (standard offset)
+                        let evdev_code = code.saturating_sub(8).max(1);
+                        let shift = level == 1 && shift_idx < 32;
+                        return Some((evdev_code, shift));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 struct Daemon {
@@ -537,18 +683,21 @@ async fn emit_text(text: &str, daemon: &Daemon) {
         daemon.config.auto_paste
     );
 
+    // Best-effort write to Wayland primary selection (and optionally the
+    // regular clipboard) for clipboard-manager users. Ignore errors —
+    // the real paste path is EI typing below.
     if let Err(e) = wl_copy(text, daemon.config.write_clipboard) {
-        log::warn!("wl-copy failed: {e:#}");
+        log::warn!("wl-copy (best-effort) failed: {e:#}");
     }
     log::info!("emit: wl_copy returned at +{:?}", t0.elapsed());
 
     if daemon.config.auto_paste {
-        if let Err(e) = ei_paste(daemon).await {
-            log::warn!("ei paste failed: {e:#}");
+        if let Err(e) = ei_type_text(text, daemon).await {
+            log::warn!("ei type failed: {e:#}");
         }
-        log::info!("emit: paste returned at +{:?}", t0.elapsed());
+        log::info!("emit: ei_type returned at +{:?}", t0.elapsed());
     } else {
-        log::info!("emit: auto_paste off, not synthesizing paste");
+        log::info!("emit: auto_paste off, not typing");
     }
 }
 
@@ -591,29 +740,57 @@ fn wl_copy(text: &str, also_clipboard: bool) -> Result<()> {
 /// sends Shift+Insert. Reuses a cached EI context across dictations to avoid
 /// creating a new XDG RemoteDesktop portal session each time.
 #[cfg(target_os = "linux")]
-async fn ei_paste(daemon: &Daemon) -> Result<()> {
+
+/// Type text character-by-character via the EI virtual keyboard, using the
+/// compositor's XKB keymap to resolve each character to the correct keycode
+/// and modifier state. This avoids the clipboard entirely.
+#[cfg(target_os = "linux")]
+async fn ei_type_text(text: &str, daemon: &Daemon) -> Result<()> {
     use reis::ei;
     use std::collections::HashMap;
 
     const KEY_LEFTSHIFT: u32 = 42;
-    const KEY_INSERT: u32 = 110;
 
-    // Check if we have a usable cached EI context.
+    // Check if we have a usable cached EI context with a keymap.
     {
         let ei_state = daemon.ei_state.lock().await;
         if let Some(ref state) = *ei_state {
-            if state.keyboard.is_alive() {
-                log::info!("ei: reusing cached context");
+            if state.keyboard.is_alive() && !state.keymap.is_null() {
+                log::info!("ei: reusing cached context for typing ({} chars)", text.len());
                 let last_serial: u32 = u32::MAX;
                 state.device.start_emulating(0, last_serial);
 
-                state.keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Press);
-                state.keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Press);
-                state.device.frame(last_serial, 0);
+                for ch in text.chars() {
+                    let (code, shift) = match char_to_evdev(ch) {
+                        Some(x) => x,
+                        None => {
+                            if !state.keymap.is_null() {
+                                match unsafe { find_key_for_char_xkb(state.keymap, ch) } {
+                                    Some(x) => x,
+                                    None => {
+                                        log::warn!("ei: cannot type U+{:04X}, skipping", ch as u32);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                log::warn!("ei: U+{:04X} not in ASCII table and no keymap, skipping", ch as u32);
+                                continue;
+                            }
+                        }
+                    };
 
-                state.keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Released);
-                state.keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Released);
-                state.device.frame(last_serial, 0);
+                    if shift {
+                        state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Press);
+                    }
+                    state.keyboard.key(code, ei::keyboard::KeyState::Press);
+                    state.device.frame(last_serial, 0);
+
+                    state.keyboard.key(code, ei::keyboard::KeyState::Released);
+                    if shift {
+                        state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Released);
+                    }
+                    state.device.frame(last_serial, 0);
+                }
 
                 state.device.stop_emulating(last_serial);
                 if let Err(e) = state.context.flush() {
@@ -622,11 +799,11 @@ async fn ei_paste(daemon: &Daemon) -> Result<()> {
                     *daemon.ei_state.lock().await = None;
                     return Err(anyhow!("ei flush: {e}"));
                 }
-                log::info!("ei: sent Shift+Insert via cached virtual keyboard");
+                log::info!("ei: typed {} chars via cached virtual keyboard", text.len());
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 return Ok(());
             }
-            log::info!("ei: cached context no longer alive, recreating");
+            log::info!("ei: cached context no longer alive or missing keymap, recreating");
         }
     }
 
@@ -645,7 +822,6 @@ async fn ei_paste(daemon: &Daemon) -> Result<()> {
             let _handshake = context.handshake();
             context.flush().map_err(|e| anyhow!("ei flush handshake: {e}"))?;
 
-            // Process handshake events.
             loop {
                 context.read().map_err(|e| anyhow!("ei read handshake: {e}"))?;
                 while let Some(result) = context.pending_event() {
@@ -697,10 +873,9 @@ async fn ei_paste(daemon: &Daemon) -> Result<()> {
     let mut devices: HashMap<ei::Device, DevData> = HashMap::new();
     let last_serial: u32 = u32::MAX;
     let mut found_keyboard = false;
+    let mut keymap_fd: Option<std::os::unix::io::OwnedFd> = None;
 
-    // Collect events until we have a usable keyboard device.
     for _ in 0..200 {
-        // cap to avoid infinite loop
         context.read().map_err(|e| anyhow!("ei read devices: {e}"))?;
 
         while let Some(result) = context.pending_event() {
@@ -719,7 +894,6 @@ async fn ei_paste(daemon: &Daemon) -> Result<()> {
                             data.caps.insert(interface.to_owned(), mask);
                         }
                         ei::seat::Event::Done => {
-                            // Bind to keyboard capability if available.
                             if let Some(&mask) = data.caps.get("ei_keyboard") {
                                 log::info!("ei: binding seat to keyboard (mask={mask})");
                                 seat.bind(mask);
@@ -751,6 +925,12 @@ async fn ei_paste(daemon: &Daemon) -> Result<()> {
                         _ => {}
                     }
                 }
+                ei::Event::Keyboard(_kb, ev) => {
+                    if let ei::keyboard::Event::Keymap { keymap: fd, .. } = ev {
+                        log::info!("ei: received keymap from compositor");
+                        keymap_fd = Some(fd);
+                    }
+                }
                 _ => {}
             }
         }
@@ -764,7 +944,6 @@ async fn ei_paste(daemon: &Daemon) -> Result<()> {
         return Err(anyhow!("ei: no keyboard device found after scanning events"));
     }
 
-    // Find the first resumed device with a keyboard.
     let mut found_device = None;
     let mut found_keyboard_obj = None;
     for (device, data) in &devices {
@@ -780,29 +959,91 @@ async fn ei_paste(daemon: &Daemon) -> Result<()> {
         _ => return Err(anyhow!("ei: keyboard found but no events sent")),
     };
 
-    // Cache the context, device, and keyboard for reuse.
+    // Parse the keymap from the compositor.
+    let (xkb_keymap, xkb_state) = match keymap_fd {
+        Some(fd) => match unsafe { parse_keymap_from_fd(fd) } {
+            Ok((km, st)) => (SendPtr(km), SendPtr(st)),
+            Err(e) => {
+                log::warn!("ei: keymap parse failed, falling back to no keymap: {e:#}");
+                (SendPtr(std::ptr::null_mut()), SendPtr(std::ptr::null_mut()))
+            }
+        },
+        None => {
+            log::warn!("ei: no keymap received from compositor");
+            (SendPtr(std::ptr::null_mut()), SendPtr(std::ptr::null_mut()))
+        }
+    };
+
+    // Cache the context for reuse.
     *daemon.ei_state.lock().await = Some(EiState {
         context: context.clone(),
         device: device.clone(),
         keyboard: keyboard.clone(),
+        keymap: xkb_keymap.0,
+        xkb_state: xkb_state.0,
     });
 
-    // Send Shift+Insert.
+    if xkb_keymap.0.is_null() {
+        // No keymap — fall back to Shift+Insert paste.
+        log::warn!("ei: no keymap available, falling back to Shift+Insert");
+        device.start_emulating(0, last_serial);
+
+        keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Press);
+        keyboard.key(110, ei::keyboard::KeyState::Press); // KEY_INSERT
+        device.frame(last_serial, 0);
+
+        keyboard.key(110, ei::keyboard::KeyState::Released);
+        keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Released);
+        device.frame(last_serial, 0);
+
+        device.stop_emulating(last_serial);
+        context.flush().map_err(|e| anyhow!("ei flush key events: {e}"))?;
+        log::info!("ei: sent Shift+Insert via virtual keyboard (no keymap fallback)");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        return Ok(());
+    }
+
+    // Type each character using the ASCII→evdev lookup table, falling back
+    // to the XKB keymap for non-ASCII characters.
     device.start_emulating(0, last_serial);
 
-    keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Press);
-    keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Press);
-    device.frame(last_serial, 0);
+    for ch in text.chars() {
+        // First try the fast direct evdev table.
+        let (code, shift) = match char_to_evdev(ch) {
+            Some(x) => x,
+            None => {
+                // Fallback: use XKB keymap for non-ASCII chars.
+                if !xkb_keymap.0.is_null() {
+                    match unsafe { find_key_for_char_xkb(xkb_keymap.0, ch) } {
+                        Some(x) => x,
+                        None => {
+                            log::warn!("ei: cannot type U+{:04X}, skipping", ch as u32);
+                            continue;
+                        }
+                    }
+                } else {
+                    log::warn!("ei: U+{:04X} not in ASCII table and no keymap, skipping", ch as u32);
+                    continue;
+                }
+            }
+        };
 
-    keyboard.key(KEY_INSERT, reis::ei::keyboard::KeyState::Released);
-    keyboard.key(KEY_LEFTSHIFT, reis::ei::keyboard::KeyState::Released);
-    device.frame(last_serial, 0);
+        if shift {
+            keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Press);
+        }
+        keyboard.key(code, ei::keyboard::KeyState::Press);
+        device.frame(last_serial, 0);
+
+        keyboard.key(code, ei::keyboard::KeyState::Released);
+        if shift {
+            keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Released);
+        }
+        device.frame(last_serial, 0);
+    }
 
     device.stop_emulating(last_serial);
     context.flush().map_err(|e| anyhow!("ei flush key events: {e}"))?;
-    log::info!("ei: sent Shift+Insert via virtual keyboard");
-
-    // Brief pause so the compositor processes the events before we close.
+    log::info!("ei: typed {} chars via virtual keyboard", text.len());
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     Ok(())
