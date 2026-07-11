@@ -750,46 +750,61 @@ async fn ei_type_text(text: &str, daemon: &Daemon) -> Result<()> {
     use std::collections::HashMap;
 
     const KEY_LEFTSHIFT: u32 = 42;
+    const KEY_INSERT: u32 = 110;
 
-    // Check if we have a usable cached EI context with a keymap.
+    // Check if we have a usable cached EI context. Reuse it regardless of
+    // whether a keymap is available — if there's no keymap we fall back to
+    // Shift+Insert paste. This avoids creating a new XDG RemoteDesktop portal
+    // session on every PTT event.
     {
         let ei_state = daemon.ei_state.lock().await;
         if let Some(ref state) = *ei_state {
-            if state.keyboard.is_alive() && !state.keymap.is_null() {
-                log::info!("ei: reusing cached context for typing ({} chars)", text.len());
+            if state.keyboard.is_alive() {
                 let last_serial: u32 = u32::MAX;
                 state.device.start_emulating(0, last_serial);
 
-                for ch in text.chars() {
-                    let (code, shift) = match char_to_evdev(ch) {
-                        Some(x) => x,
-                        None => {
-                            if !state.keymap.is_null() {
-                                match unsafe { find_key_for_char_xkb(state.keymap, ch) } {
-                                    Some(x) => x,
-                                    None => {
-                                        log::warn!("ei: cannot type U+{:04X}, skipping", ch as u32);
-                                        continue;
+                if state.keymap.is_null() {
+                    // Fall back to Shift+Insert paste (no keymap available).
+                    log::info!("ei: reusing cached context, Shift+Insert fallback");
+                    state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Press);
+                    state.keyboard.key(KEY_INSERT, ei::keyboard::KeyState::Press);
+                    state.device.frame(last_serial, 0);
+                    state.keyboard.key(KEY_INSERT, ei::keyboard::KeyState::Released);
+                    state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Released);
+                    state.device.frame(last_serial, 0);
+                } else {
+                    log::info!("ei: reusing cached context for typing ({} chars)", text.len());
+                    for ch in text.chars() {
+                        let (code, shift) = match char_to_evdev(ch) {
+                            Some(x) => x,
+                            None => {
+                                if !state.keymap.is_null() {
+                                    match unsafe { find_key_for_char_xkb(state.keymap, ch) } {
+                                        Some(x) => x,
+                                        None => {
+                                            log::warn!("ei: cannot type U+{:04X}, skipping", ch as u32);
+                                            continue;
+                                        }
                                     }
+                                } else {
+                                    log::warn!("ei: U+{:04X} not in ASCII table and no keymap, skipping", ch as u32);
+                                    continue;
                                 }
-                            } else {
-                                log::warn!("ei: U+{:04X} not in ASCII table and no keymap, skipping", ch as u32);
-                                continue;
                             }
+                        };
+
+                        if shift {
+                            state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Press);
                         }
-                    };
+                        state.keyboard.key(code, ei::keyboard::KeyState::Press);
+                        state.device.frame(last_serial, 0);
 
-                    if shift {
-                        state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Press);
+                        state.keyboard.key(code, ei::keyboard::KeyState::Released);
+                        if shift {
+                            state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Released);
+                        }
+                        state.device.frame(last_serial, 0);
                     }
-                    state.keyboard.key(code, ei::keyboard::KeyState::Press);
-                    state.device.frame(last_serial, 0);
-
-                    state.keyboard.key(code, ei::keyboard::KeyState::Released);
-                    if shift {
-                        state.keyboard.key(KEY_LEFTSHIFT, ei::keyboard::KeyState::Released);
-                    }
-                    state.device.frame(last_serial, 0);
                 }
 
                 state.device.stop_emulating(last_serial);
@@ -799,11 +814,11 @@ async fn ei_type_text(text: &str, daemon: &Daemon) -> Result<()> {
                     *daemon.ei_state.lock().await = None;
                     return Err(anyhow!("ei flush: {e}"));
                 }
-                log::info!("ei: typed {} chars via cached virtual keyboard", text.len());
+                log::info!("ei: done with cached context");
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 return Ok(());
             }
-            log::info!("ei: cached context no longer alive or missing keymap, recreating");
+            log::info!("ei: cached context no longer alive, recreating");
         }
     }
 
